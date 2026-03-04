@@ -1,2 +1,2 @@
 streamlit>=1.32.0
-yt-dlp>=2024.3.10
+nodejs
