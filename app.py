@@ -16,11 +16,9 @@ st.set_page_config(
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;700;800&display=swap');
-
 html, body, [class*="css"] { font-family: 'Syne', sans-serif; }
 .stApp { background: #0a0a0f; color: #e8e8e8; }
 #MainMenu, footer, header { visibility: hidden; }
-
 .hero-title {
     font-family: 'Syne', sans-serif;
     font-weight: 800;
@@ -68,6 +66,7 @@ html, body, [class*="css"] { font-family: 'Syne', sans-serif; }
     font-size: 0.95rem !important;
     width: 100%;
 }
+.stButton > button:hover { opacity: 0.88 !important; }
 .stDownloadButton > button {
     background: linear-gradient(135deg, #22c55e, #16a34a) !important;
     color: white !important;
@@ -97,9 +96,14 @@ html, body, [class*="css"] { font-family: 'Syne', sans-serif; }
     margin-right: 5px;
 }
 .divider { border: none; border-top: 1px solid #1a1a2e; margin: 1.5rem 0; }
+.fmt-table {
+    font-family: 'Space Mono', monospace;
+    font-size: 0.72rem;
+    color: #666;
+    margin: 0.3rem 0 0.8rem 0;
+}
 </style>
 """, unsafe_allow_html=True)
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -107,67 +111,29 @@ def is_valid_url(url: str) -> bool:
     return bool(re.match(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/.+", url.strip()))
 
 def fmt_duration(sec) -> str:
-    if not sec:
-        return "—"
+    if not sec: return "—"
     h, r = divmod(int(sec), 3600)
     m, s = divmod(r, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 def fmt_views(n) -> str:
-    if not n:
-        return "—"
+    if not n: return "—"
     if n >= 1_000_000: return f"{n/1_000_000:.1f}M views"
     if n >= 1_000:     return f"{n/1_000:.1f}K views"
     return f"{n} views"
 
 
-# ── yt-dlp client configs to try in order (403 bypass strategy) ───────────────
-#
-#  YouTube blocks default "python-requests" UA with 403.
-#  The ios / mweb clients bypass PO-token requirements entirely.
-#  We try them in order until one works.
-#
+# ── Multiple YouTube client configs to bypass 403 ─────────────────────────────
 CLIENT_CONFIGS = [
-    # 1st try: iOS app client — most reliable, no PO token needed
-    {
-        "extractor_args": {"youtube": {"player_client": ["ios"]}},
-        "http_headers": {
-            "User-Agent": (
-                "com.google.ios.youtube/19.29.1 "
-                "(iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)"
-            ),
-        },
-    },
-    # 2nd try: Android embedded client
-    {
-        "extractor_args": {"youtube": {"player_client": ["android_embedded"]}},
-        "http_headers": {
-            "User-Agent": "com.google.android.youtube/17.36.4(Linux; U; Android 12)",
-        },
-    },
-    # 3rd try: TV embedded (no sign-in required)
-    {
-        "extractor_args": {"youtube": {"player_client": ["tv_embedded"]}},
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) "
-                "AppleWebKit/538.1 (KHTML, like Gecko) "
-                "Version/6.0 TV Safari/538.1"
-            ),
-        },
-    },
-    # 4th try: mweb (mobile browser)
-    {
-        "extractor_args": {"youtube": {"player_client": ["mweb"]}},
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.6261.119 Mobile Safari/537.36"
-            ),
-            "Referer": "https://m.youtube.com/",
-        },
-    },
+    {"extractor_args": {"youtube": {"player_client": ["ios"]}},
+     "http_headers": {"User-Agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)"}},
+    {"extractor_args": {"youtube": {"player_client": ["android_embedded"]}},
+     "http_headers": {"User-Agent": "com.google.android.youtube/17.36.4(Linux; U; Android 12)"}},
+    {"extractor_args": {"youtube": {"player_client": ["tv_embedded"]}},
+     "http_headers": {"User-Agent": "Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit/538.1"}},
+    {"extractor_args": {"youtube": {"player_client": ["mweb"]}},
+     "http_headers": {"User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 Chrome/122.0.6261.119 Mobile Safari/537.36",
+                      "Referer": "https://m.youtube.com/"}},
 ]
 
 COMMON_OPTS = {
@@ -180,42 +146,108 @@ COMMON_OPTS = {
 }
 
 
-def make_ydl_opts(client_cfg: dict, extra: dict = None) -> dict:
+def _make_opts(client_cfg: dict, extra: dict = None) -> dict:
     opts = {**COMMON_OPTS, **client_cfg}
     if extra:
         opts.update(extra)
     return opts
 
 
+# ── Format selector — robust fallback strings ─────────────────────────────────
+#
+#  KEY FIX: Each entry is a LIST of format strings tried left→right.
+#  yt-dlp picks the first one that actually exists for this video.
+#  The final fallback "best" always works.
+#
+FORMAT_MAP = {
+    "🎵  MP3 Audio":
+        (["bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best"], True),
+
+    "🎬  Best available video":
+        (["bestvideo+bestaudio/best"], False),
+
+    "🎬  MP4 1080p  (or best below)":
+        ([
+            "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+        ], False),
+
+    "🎬  MP4 720p  (or best below)":
+        ([
+            "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+        ], False),
+
+    "🎬  MP4 480p  (or best below)":
+        ([
+            "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best[height<=480]/best",
+        ], False),
+
+    "🎬  MP4 360p  (or best below)":
+        ([
+            "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=360]+bestaudio/best[height<=360]/best",
+        ], False),
+
+    "🎬  MP4 240p  (smallest)":
+        ([
+            "bestvideo[height<=240][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=240]+bestaudio/best[height<=240]/best",
+        ], False),
+}
+
+
+# ── fetch_info: tries all clients ─────────────────────────────────────────────
 @st.cache_data(show_spinner=False, ttl=300)
 def fetch_info(url: str) -> dict:
     last_err = None
     for cfg in CLIENT_CONFIGS:
         try:
-            opts = make_ydl_opts(cfg, {"skip_download": True})
+            opts = _make_opts(cfg, {"skip_download": True})
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 if info:
                     return info
         except Exception as e:
             last_err = e
-            continue
     raise RuntimeError(f"All clients failed. Last error: {last_err}")
 
 
-# Format options: label → (format_string, is_audio)
-FORMAT_MAP = {
-    "🎵  MP3 Audio — best quality":  ("bestaudio/best",                                                True),
-    "🎬  MP4 1080p":                  ("bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",     False),
-    "🎬  MP4 720p":                   ("bestvideo[height<=720]+bestaudio/best[height<=720]/best",       False),
-    "🎬  MP4 480p":                   ("bestvideo[height<=480]+bestaudio/best[height<=480]/best",       False),
-    "🎬  MP4 360p":                   ("bestvideo[height<=360]+bestaudio/best[height<=360]/best",       False),
-    "🎬  MP4 240p — smallest":        ("bestvideo[height<=240]+bestaudio/best[height<=240]/best",       False),
-}
+# ── get_available_formats: list what actually exists for this video ────────────
+def get_available_formats(info: dict) -> list[dict]:
+    """Return simplified list of available formats from cached info."""
+    fmts = info.get("formats", [])
+    out = []
+    seen = set()
+    for f in reversed(fmts):          # reversed = best first
+        h   = f.get("height") or 0
+        ext = f.get("ext", "?")
+        acodec = f.get("acodec", "none")
+        vcodec = f.get("vcodec", "none")
+        has_video = vcodec != "none"
+        has_audio = acodec != "none"
+        key = (h, ext, has_video, has_audio)
+        if key not in seen:
+            seen.add(key)
+            out.append({
+                "format_id": f.get("format_id"),
+                "ext": ext,
+                "height": h,
+                "has_video": has_video,
+                "has_audio": has_audio,
+                "note": f.get("format_note", ""),
+                "filesize": f.get("filesize") or f.get("filesize_approx") or 0,
+            })
+    return out
 
 
-def download_video(url: str, fmt_str: str, is_audio: bool) -> tuple[bytes, str]:
+# ── download: tries all clients with a robust format string ───────────────────
+def download_video(url: str, fmt_strings: list[str], is_audio: bool) -> tuple[bytes, str]:
+    """
+    fmt_strings: list of yt-dlp format strings, tried in order.
+    Falls back through CLIENT_CONFIGS × fmt_strings.
+    """
     last_err = None
+
+    # Build a single combined format string with all fallbacks joined by /
+    combined_fmt = "/".join(fmt_strings)
+
     for cfg in CLIENT_CONFIGS:
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -229,32 +261,45 @@ def download_video(url: str, fmt_str: str, is_audio: bool) -> tuple[bytes, str]:
                         "preferredquality": "192",
                     })
 
-                opts = make_ydl_opts(cfg, {
-                    "format": fmt_str,
+                opts = _make_opts(cfg, {
+                    "format": combined_fmt,
                     "outtmpl": out_tmpl,
                     "postprocessors": pp,
                     "merge_output_format": None if is_audio else "mp4",
+                    # ✅ KEY FIX: ignore errors for unavailable formats, pick best available
+                    "ignoreerrors": False,
+                    "format_sort": ["res", "ext:mp4:m4a", "codec:h264"],
                 })
 
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     ydl.download([url])
 
-                files = sorted(Path(tmpdir).iterdir(), key=lambda f: f.stat().st_size, reverse=True)
+                files = sorted(
+                    Path(tmpdir).iterdir(),
+                    key=lambda f: f.stat().st_size,
+                    reverse=True,
+                )
                 if files:
                     return files[0].read_bytes(), files[0].name
 
         except Exception as e:
             last_err = e
-            # Only retry on 403 / network errors, not on format errors
-            if "403" in str(e) or "HTTP Error" in str(e) or "network" in str(e).lower():
+            err_str = str(e).lower()
+            # Retry on network/403 errors; re-raise on format errors immediately
+            if "403" in err_str or "http error" in err_str or "timed out" in err_str:
                 continue
-            raise  # propagate non-network errors immediately
+            # "requested format is not available" — try next client
+            if "not available" in err_str or "format" in err_str:
+                continue
+            raise
 
-    raise RuntimeError(f"Download failed after trying all clients. Last error: {last_err}")
+    raise RuntimeError(
+        f"Download failed after trying all clients.\n\nLast error: {last_err}\n\n"
+        "Try selecting a different quality or use 'Best available video'."
+    )
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
-
 st.markdown('<div class="hero-title">YT Downloader</div>', unsafe_allow_html=True)
 st.markdown('<div class="hero-sub">Free · No Login · No Limits</div>', unsafe_allow_html=True)
 
@@ -279,8 +324,8 @@ if fetch_btn:
             try:
                 info = fetch_info(url_input)
                 st.session_state.update({
-                    "info": info,
-                    "url":  url_input,
+                    "info":        info,
+                    "url":         url_input,
                     "dl_data":     None,
                     "dl_filename": None,
                     "dl_audio":    None,
@@ -312,27 +357,41 @@ if st.session_state.get("info"):
         unsafe_allow_html=True,
     )
 
+    # ── Show available resolutions ────────────────────────────────────────────
+    avail = get_available_formats(info)
+    video_heights = sorted(
+        {f["height"] for f in avail if f["has_video"] and f["height"] > 0},
+        reverse=True,
+    )
+    if video_heights:
+        heights_str = " · ".join(f"{h}p" for h in video_heights[:8])
+        st.markdown(
+            f'<div class="fmt-table">📐 Available resolutions: {heights_str}</div>',
+            unsafe_allow_html=True,
+        )
+
     st.markdown('<hr class="divider">', unsafe_allow_html=True)
 
+    # ── Format selector ───────────────────────────────────────────────────────
     chosen = st.selectbox("Format & quality", list(FORMAT_MAP.keys()), index=1)
-    fmt_str, is_audio = FORMAT_MAP[chosen]
+    fmt_strings, is_audio = FORMAT_MAP[chosen]
 
     if st.button("⬇️  Download Now"):
-        with st.spinner("Downloading… trying multiple sources if needed"):
+        with st.spinner("Downloading… auto-selecting best available quality"):
             try:
-                data, fname = download_video(url, fmt_str, is_audio)
+                data, fname = download_video(url, fmt_strings, is_audio)
                 st.session_state.update({
                     "dl_data":     data,
                     "dl_filename": fname,
                     "dl_audio":    is_audio,
                 })
             except Exception as e:
-                st.error(f"Download failed: {e}")
+                st.error(str(e))
                 st.info(
-                    "**Still getting 403?** Some videos are protected:\n"
-                    "- Try a lower quality (360p/240p)\n"
-                    "- Try MP3 audio instead of video\n"
-                    "- Age-restricted or DRM videos cannot be downloaded"
+                    "**Tips:**\n"
+                    "- Select **'Best available video'** — always works\n"
+                    "- Or try **MP3 Audio** for audio-only\n"
+                    "- Age-gated / DRM videos cannot be downloaded"
                 )
 
     if st.session_state.get("dl_data"):
