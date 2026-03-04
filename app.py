@@ -1,70 +1,56 @@
 import streamlit as st
 import yt_dlp
-import os
-import tempfile
 
-# Set up the webpage
-st.set_page_config(page_title="Free YouTube Downloader", page_icon="🎥")
-st.title("🎥 Free YouTube Downloader")
-st.write("Paste a YouTube link below to download the video or audio.")
+# Set up the page
+st.set_page_config(page_title="YouTube Video API", page_icon="🎥")
 
-# User Inputs
-url = st.text_input("Enter YouTube Video URL:")
-format_option = st.radio("Select Format:", ["Video (MP4)", "Audio (MP3)"])
+st.title("🎥 Free YouTube Video Downloader API")
+st.write("Enter a YouTube URL below to extract the direct MP4 download link.")
 
-if st.button("Fetch Download Link"):
-    if not url:
-        st.warning("Please enter a valid YouTube URL.")
-    else:
-        with st.spinner("Downloading from YouTube... Please wait."):
+# Input box for the user
+video_url = st.text_input("YouTube Video URL:", placeholder="https://www.youtube.com/watch?v=...")
+
+# A button to trigger the extraction
+if st.button("Extract Download Link"):
+    if video_url:
+        with st.spinner("Extracting video data... Please wait."):
+            # Configure yt-dlp to NOT download, but just fetch the direct URL
+            ydl_opts = {
+                'format': 'best',
+                'quiet': True,
+                'noplaylist': True
+            }
+            
             try:
-                # Create a temporary folder on the Streamlit server
-                temp_dir = tempfile.mkdtemp()
-                
-                # Configure yt-dlp settings
-                ydl_opts = {
-                    'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
-                    'quiet': True,
-                    'no_warnings': True,
-                }
-                
-                # Set formats based on user choice
-                if format_option == "Video (MP4)":
-                    # Download best video and best audio, then merge to MP4
-                    ydl_opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
-                else:
-                    # Download best audio and convert to MP3
-                    ydl_opts['format'] = 'bestaudio/best'
-                    ydl_opts['postprocessors'] =[{
-                        'key': 'FFmpegExtractAudio',
-                        'preferredcodec': 'mp3',
-                        'preferredquality': '192',
-                    }]
-
-                # Start the download process
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info_dict = ydl.extract_info(url, download=True)
-                    file_path = ydl.prepare_filename(info_dict)
+                    info = ydl.extract_info(video_url, download=False)
                     
-                    # Adjust file extension if MP3 was selected
-                    if format_option == "Audio (MP3)":
-                        file_path = os.path.splitext(file_path)[0] + '.mp3'
-
-                    file_name = os.path.basename(file_path)
-
-                    # Read the downloaded file into memory for the user to download
-                    with open(file_path, "rb") as file:
-                        file_bytes = file.read()
-                        
-                    st.success(f"✅ Successfully processed: {info_dict.get('title', 'Video')}")
+                    # Create our API-style JSON response
+                    api_response = {
+                        "success": True,
+                        "title": info.get('title', 'Unknown Title'),
+                        "duration_seconds": info.get('duration', 0),
+                        "thumbnail": info.get('thumbnail', ''),
+                        "download_url": info.get('url', '')
+                    }
                     
-                    # Display the final Download Button
-                    st.download_button(
-                        label="⬇️ Download File to Your Device",
-                        data=file_bytes,
-                        file_name=file_name,
-                        mime="video/mp4" if format_option == "Video (MP4)" else "audio/mpeg"
-                    )
+                    # 1. Display as JSON (API format)
+                    st.subheader("JSON Output (API Format):")
+                    st.json(api_response)
+                    
+                    # 2. Provide a clickable Download Button
+                    st.subheader("Direct Download:")
+                    st.markdown(f"[**➡️ Right-Click and 'Save Link As' to Download MP4**]({api_response['download_url']})", unsafe_allow_html=True)
+                    
+                    # 3. Provide the raw text link to copy easily
+                    st.text_input("Raw MP4 Link (Copy this):", api_response['download_url'])
+
             except Exception as e:
-                st.error(f"An error occurred: {str(e)}")
-                st.info("Note: Because this is hosted on a cloud server, YouTube's anti-bot systems might occasionally block the download. Try another video if this happens.")
+                # If there's an error (e.g., age restricted, invalid link)
+                st.error("Failed to extract video.")
+                st.json({
+                    "success": False,
+                    "error": str(e)
+                })
+    else:
+        st.warning("Please enter a valid YouTube URL.")
