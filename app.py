@@ -1,543 +1,370 @@
-"""
-YT Downloader — Streamlit UI + built-in REST API
-═════════════════════════════════════════════════
-• Streamlit UI  →  port 8501  (default)
-• FastAPI REST  →  port 8000  (background thread, started ONCE at module level)
-
-API Endpoints:
-  GET  /health
-  GET  /api/info?url=<youtube_url>
-  GET  /api/formats?url=<youtube_url>
-  GET  /api/stream?url=<youtube_url>&format_id=<id>
-  GET  /api/search?q=<query>&max_results=5
-  Swagger UI  →  http://localhost:8000/docs
-"""
-
-# ── std-lib imports FIRST, before streamlit ──────────────────────────────────
-import re
-import threading
-import urllib.parse
-
-# ── FastAPI (started at module level — avoids ScriptRunContext warning) ───────
-from fastapi import FastAPI, Query, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
-import yt_dlp
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SHARED YT-DLP HELPER
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _ydl_base() -> dict:
-    return {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "geo_bypass": True,
-        "nocheckcertificate": True,
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.youtube.com/",
-            "Origin": "https://www.youtube.com",
-        },
-        "extractor_args": {
-            "youtube": {"player_client": ["ios", "android", "web"]}
-        },
-        "retries": 5,
-        "socket_timeout": 30,
-    }
-
-
-def _extract(url: str) -> dict:
-    with yt_dlp.YoutubeDL(_ydl_base()) as ydl:
-        return ydl.extract_info(url, download=False)
-
-
-def _parse_formats(info: dict) -> list:
-    raw, out, seen = info.get("formats", []), [], set()
-    for f in sorted(raw, key=lambda x: x.get("height") or 0, reverse=True):
-        if not f.get("url"):
-            continue
-        vcodec = f.get("vcodec", "none")
-        acodec = f.get("acodec", "none")
-        h      = f.get("height")
-        ext    = f.get("ext", "?")
-
-        if   vcodec == "none" and acodec != "none": kind = "audio"
-        elif vcodec != "none" and acodec != "none": kind = "muxed"
-        elif vcodec != "none":                       kind = "video"
-        else: continue
-
-        key = f"{kind}-{h}-{ext}"
-        if key in seen:
-            continue
-        seen.add(key)
-
-        out.append({
-            "format_id": f["format_id"],
-            "kind":      kind,
-            "ext":       ext,
-            "height":    h,
-            "fps":       f.get("fps"),
-            "vcodec":    vcodec,
-            "acodec":    acodec,
-            "abr":       f.get("abr"),
-            "tbr":       f.get("tbr"),
-            "filesize":  f.get("filesize") or f.get("filesize_approx"),
-            "url":       f["url"],
-            "note":      f.get("format_note", ""),
-        })
-    return out
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FASTAPI APP
-# ─────────────────────────────────────────────────────────────────────────────
-
-api = FastAPI(
-    title="YT Downloader API",
-    description=(
-        "Extract YouTube video info & direct CDN stream URLs via yt-dlp.\n\n"
-        "**No 403** — CDN URLs are downloaded by the caller's browser/IP, not the server."
-    ),
-    version="2.1.0",
-)
-api.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-
-@api.get("/health", tags=["status"])
-def health():
-    return {"status": "ok", "service": "YT Downloader API", "version": "2.1.0"}
-
-
-@api.get("/api/info", tags=["youtube"])
-def get_info(url: str = Query(..., description="Full YouTube URL")):
-    """Full metadata + all available formats with direct CDN URLs."""
-    try:
-        info = _extract(url)
-    except Exception as e:
-        raise HTTPException(400, detail=str(e))
-    return {
-        "id":          info.get("id"),
-        "title":       info.get("title"),
-        "uploader":    info.get("uploader"),
-        "duration":    info.get("duration"),
-        "view_count":  info.get("view_count"),
-        "like_count":  info.get("like_count"),
-        "thumbnail":   info.get("thumbnail"),
-        "description": (info.get("description") or "")[:500],
-        "webpage_url": info.get("webpage_url"),
-        "formats":     _parse_formats(info),
-    }
-
-
-@api.get("/api/formats", tags=["youtube"])
-def get_formats(url: str = Query(..., description="Full YouTube URL")):
-    """Lighter version — returns only the format list."""
-    try:
-        info = _extract(url)
-    except Exception as e:
-        raise HTTPException(400, detail=str(e))
-    return {"id": info.get("id"), "title": info.get("title"), "formats": _parse_formats(info)}
-
-
-@api.get("/api/stream", tags=["youtube"])
-def get_stream(
-    url:       str  = Query(...,  description="Full YouTube URL"),
-    format_id: str  = Query(None, description="Format ID from /api/formats. Omit for best."),
-):
-    """Returns a single direct CDN URL. Open in browser or download manager."""
-    try:
-        opts = {**_ydl_base(), "format": format_id if format_id else "best[ext=mp4]/best"}
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-
-        if format_id:
-            match = next((f for f in info.get("formats", []) if f["format_id"] == format_id), None)
-            if not match:
-                raise HTTPException(404, detail=f"format_id '{format_id}' not found")
-            stream_url = match["url"]
-            ext        = match.get("ext", "mp4")
-            height     = match.get("height")
-        else:
-            stream_url = info.get("url") or (info.get("formats") or [{}])[-1].get("url")
-            ext        = info.get("ext", "mp4")
-            height     = info.get("height")
-
-        if not stream_url:
-            raise HTTPException(500, detail="Could not extract stream URL")
-
-        return {
-            "id": info.get("id"), "title": info.get("title"),
-            "format_id": format_id or "best",
-            "ext": ext, "height": height,
-            "stream_url": stream_url, "expires_in": "~6 hours",
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(400, detail=str(e))
-
-
-@api.get("/api/search", tags=["youtube"])
-def search(
-    q:           str = Query(...,  description="Search query"),
-    max_results: int = Query(5, ge=1, le=20, description="Number of results (1-20)"),
-):
-    """Search YouTube — returns video metadata list."""
-    try:
-        opts = {**_ydl_base(), "default_search": "ytsearch", "noplaylist": True}
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(f"ytsearch{max_results}:{q}", download=False)
-        results = []
-        for e in (info.get("entries") or []):
-            if not e: continue
-            results.append({
-                "id": e.get("id"), "title": e.get("title"),
-                "uploader": e.get("uploader"), "duration": e.get("duration"),
-                "view_count": e.get("view_count"), "thumbnail": e.get("thumbnail"),
-                "url": e.get("webpage_url") or f"https://youtube.com/watch?v={e.get('id')}",
-            })
-        return {"query": q, "results": results}
-    except Exception as e:
-        raise HTTPException(400, detail=str(e))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# START API THREAD ONCE AT MODULE LEVEL  ← fixes ScriptRunContext warning
-# ─────────────────────────────────────────────────────────────────────────────
-
-_API_PORT = 8000
-
-def _run_api():
-    uvicorn.run(api, host="0.0.0.0", port=_API_PORT, log_level="error")
-
-# Module-level flag — persists across Streamlit reruns, no session_state needed
-if not hasattr(threading, "_yt_api_started"):
-    _t = threading.Thread(target=_run_api, daemon=True, name="yt-api")
-    _t.start()
-    threading._yt_api_started = True   # type: ignore[attr-defined]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STREAMLIT  (imported AFTER thread is started)
-# ─────────────────────────────────────────────────────────────────────────────
 import streamlit as st
-
-st.set_page_config(page_title="YT Downloader + API", page_icon="▶️", layout="centered")
+import yt_dlp
+import os
+import re
+import tempfile
+from pathlib import Path
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CSS
+# PAGE CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="VAULTDL · YouTube Downloader",
+    page_icon="⚡",
+    layout="centered",
+    initial_sidebar_state="collapsed",
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GLOBAL CSS  — Cyberpunk / Neon-Noir aesthetic
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;700;800&display=swap');
-html,body,[class*="css"]{font-family:'Syne',sans-serif;}
-.stApp{background:#08080f;color:#e8e8e8;}
-#MainMenu,footer,header{visibility:hidden;}
+@import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Mono:ital,wght@0,300;0,400;0,500;1,300&family=Outfit:wght@300;400;600;700;900&display=swap');
 
-.hero-title{
-    font-family:'Syne',sans-serif;font-weight:800;font-size:2.8rem;letter-spacing:-2px;
-    background:linear-gradient(135deg,#ff4d4d 0%,#ff9a3c 50%,#ffe066 100%);
-    -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
+:root {
+  --bg:      #05050d;
+  --surface: #0c0c18;
+  --border:  #1a1a30;
+  --accent1: #00f0ff;
+  --accent2: #ff2d6b;
+  --accent3: #ffe500;
+  --text:    #d4d4e8;
+  --muted:   #3a3a58;
+  --success: #00e87a;
+  --font-hero: 'Bebas Neue', sans-serif;
+  --font-body: 'Outfit', sans-serif;
+  --font-mono: 'DM Mono', monospace;
 }
-.hero-sub{
-    font-family:'Space Mono',monospace;font-size:.7rem;color:#444;
-    letter-spacing:3px;text-transform:uppercase;margin-bottom:1.5rem;
+
+*, *::before, *::after { box-sizing: border-box; }
+html, body, [class*="css"] { font-family: var(--font-body) !important; color: var(--text); }
+.stApp { background: var(--bg); min-height: 100vh; }
+#MainMenu, footer, header { visibility: hidden !important; }
+.block-container { padding-top: 2rem !important; max-width: 780px !important; }
+
+/* Animated grid */
+.stApp::before {
+  content: '';
+  position: fixed; inset: 0;
+  background-image:
+    linear-gradient(rgba(0,240,255,.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0,240,255,.04) 1px, transparent 1px);
+  background-size: 44px 44px;
+  pointer-events: none; z-index: 0;
 }
-.stTabs [data-baseweb="tab-list"]{background:#0f0f1a;border-radius:10px;padding:4px;gap:4px;}
-.stTabs [data-baseweb="tab"]{
-    background:transparent;border-radius:8px;color:#555;
-    font-family:'Syne',sans-serif;font-weight:700;font-size:.85rem;padding:.4rem 1.2rem;
+
+/* Glow orb */
+.stApp::after {
+  content: '';
+  position: fixed; top: -200px; left: -200px;
+  width: 700px; height: 700px;
+  background: radial-gradient(circle, rgba(0,240,255,.07) 0%, transparent 70%);
+  pointer-events: none; z-index: 0;
+  animation: drift 12s ease-in-out infinite alternate;
 }
-.stTabs [aria-selected="true"]{background:#1e1e30!important;color:#e8e8e8!important;}
-.stTextInput>div>div>input{
-    background:#0f0f18!important;border:1.5px solid #2a2a3e!important;border-radius:10px!important;
-    color:#e8e8e8!important;font-family:'Space Mono',monospace!important;
-    font-size:.82rem!important;padding:.7rem 1rem!important;
+@keyframes drift {
+  from { transform: translate(0,0); }
+  to   { transform: translate(120px,80px); }
 }
-.stTextInput>div>div>input:focus{border-color:#ff4d4d!important;box-shadow:0 0 0 2px rgba(255,77,77,.12)!important;}
-.stSelectbox>div>div{background:#0f0f18!important;border:1.5px solid #2a2a3e!important;border-radius:10px!important;color:#e8e8e8!important;}
-.stButton>button{
-    background:linear-gradient(135deg,#ff4d4d,#ff7a3c)!important;color:#fff!important;
-    border:none!important;border-radius:10px!important;font-family:'Syne',sans-serif!important;
-    font-weight:700!important;font-size:.9rem!important;padding:.6rem 1.6rem!important;width:100%;
+
+/* Hero */
+.hero-wrap { position: relative; text-align: center; padding: 3rem 0 2rem; z-index: 1; }
+.hero-eyebrow { font-family: var(--font-mono); font-size:.65rem; letter-spacing:6px; color: var(--accent1); text-transform:uppercase; margin-bottom:.6rem; opacity:.8; }
+.hero-title {
+  font-family: var(--font-hero); font-size: clamp(4rem,14vw,8rem);
+  line-height:.92; letter-spacing:4px;
+  background: linear-gradient(135deg, var(--accent1) 0%, #fff 40%, var(--accent2) 100%);
+  -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text;
+  margin:0; animation: fadeUp .7s ease both;
 }
-.stButton>button:hover{opacity:.85!important;transform:translateY(-1px)!important;}
-.dl-btn{
-    display:block;width:100%;padding:.65rem 1.8rem;
-    background:linear-gradient(135deg,#22c55e,#16a34a);color:#fff!important;
-    border:none;border-radius:10px;font-family:'Syne',sans-serif;font-weight:700;
-    font-size:.9rem;text-align:center;text-decoration:none!important;
-    cursor:pointer;margin-top:.5rem;box-sizing:border-box;
+.hero-tagline { font-family: var(--font-mono); font-size:.75rem; color: var(--muted); margin-top:.9rem; letter-spacing:2px; animation: fadeUp .9s ease both; }
+.pill-row { display:flex; gap:8px; justify-content:center; margin-top:1.2rem; flex-wrap:wrap; animation: fadeUp 1.1s ease both; }
+.pill { background:rgba(0,240,255,.07); border:1px solid rgba(0,240,255,.18); border-radius:999px; padding:4px 14px; font-family: var(--font-mono); font-size:.65rem; color: var(--accent1); letter-spacing:1px; }
+.pill.pink { background:rgba(255,45,107,.07); border-color:rgba(255,45,107,.2); color: var(--accent2); }
+.pill.yellow { background:rgba(255,229,0,.07); border-color:rgba(255,229,0,.2); color: var(--accent3); }
+
+@keyframes fadeUp { from { opacity:0; transform:translateY(18px); } to { opacity:1; transform:translateY(0); } }
+
+/* Divider */
+.neon-divider { border:none; height:1px; background:linear-gradient(90deg,transparent,var(--accent1),transparent); margin:2rem 0; opacity:.25; }
+
+/* Input label */
+.input-label { font-family: var(--font-mono); font-size:.65rem; color: var(--accent1); letter-spacing:3px; text-transform:uppercase; margin-bottom:.4rem; }
+
+/* Text input */
+.stTextInput > label { display:none !important; }
+.stTextInput > div > div { background: var(--surface) !important; border-radius:12px !important; border:1.5px solid var(--border) !important; transition:border-color .2s, box-shadow .2s !important; }
+.stTextInput > div > div:focus-within { border-color: var(--accent1) !important; box-shadow:0 0 0 3px rgba(0,240,255,.1), 0 0 24px rgba(0,240,255,.08) !important; }
+.stTextInput input { color: var(--text) !important; font-family: var(--font-mono) !important; font-size:.85rem !important; background:transparent !important; padding:.85rem 1.1rem !important; letter-spacing:.5px; }
+.stTextInput input::placeholder { color: var(--muted) !important; }
+
+/* Selectbox */
+.stSelectbox > label { font-family: var(--font-mono) !important; font-size:.65rem !important; color: var(--accent1) !important; letter-spacing:3px !important; text-transform:uppercase !important; }
+.stSelectbox > div > div { background: var(--surface) !important; border:1.5px solid var(--border) !important; border-radius:12px !important; color: var(--text) !important; }
+.stSelectbox > div > div:focus-within { border-color: var(--accent2) !important; box-shadow:0 0 0 3px rgba(255,45,107,.1) !important; }
+
+/* Primary button */
+.stButton > button {
+  width:100% !important;
+  background: linear-gradient(135deg, var(--accent1) 0%, #006aff 100%) !important;
+  color:#000 !important; font-family: var(--font-body) !important; font-weight:700 !important;
+  font-size:.9rem !important; letter-spacing:1.5px !important; text-transform:uppercase !important;
+  border:none !important; border-radius:12px !important; padding:.8rem 2rem !important;
+  transition:transform .15s, box-shadow .15s, opacity .15s !important;
+  box-shadow:0 0 30px rgba(0,240,255,.25) !important;
 }
-.dl-btn:hover{opacity:.85;}
-.api-card{
-    background:#0c0c18;border:1px solid #1e1e2e;border-radius:12px;
-    padding:1rem 1.2rem;margin:.5rem 0;
+.stButton > button:hover { transform:translateY(-2px) !important; box-shadow:0 0 50px rgba(0,240,255,.4) !important; opacity:.92 !important; }
+.stButton > button:active { transform:translateY(0) !important; }
+
+/* Download button */
+.stDownloadButton > button {
+  width:100% !important;
+  background: linear-gradient(135deg, var(--success) 0%, #00a854 100%) !important;
+  color:#000 !important; font-family: var(--font-body) !important; font-weight:700 !important;
+  font-size:.9rem !important; letter-spacing:1.5px !important; text-transform:uppercase !important;
+  border:none !important; border-radius:12px !important; padding:.85rem 2rem !important;
+  animation: pulseGlow 2s ease infinite;
 }
-.api-method{
-    display:inline-block;padding:2px 10px;border-radius:5px;
-    font-family:'Space Mono',monospace;font-size:.72rem;font-weight:700;margin-right:8px;
+@keyframes pulseGlow { 0%,100% { box-shadow:0 0 30px rgba(0,232,122,.25); } 50% { box-shadow:0 0 55px rgba(0,232,122,.5); } }
+.stDownloadButton > button:hover { transform:translateY(-2px) !important; }
+
+/* Video card */
+.vid-card {
+  background: var(--surface); border:1px solid var(--border); border-radius:18px;
+  overflow:hidden; position:relative; animation: fadeUp .5s ease both;
 }
-.get{background:#0d2a0d;color:#4ade80;border:1px solid #1a3a1a;}
-.api-path{font-family:'Space Mono',monospace;font-size:.85rem;color:#e8e8e8;}
-.api-desc{font-family:'Space Mono',monospace;font-size:.68rem;color:#555;margin-top:.25rem;}
-.vtitle{font-family:'Syne',sans-serif;font-weight:700;font-size:1.05rem;color:#e8e8e8;margin:.6rem 0 .2rem;}
-.badge{
-    display:inline-block;background:#1a1a28;border:1px solid #252538;
-    border-radius:6px;padding:2px 9px;font-family:'Space Mono',monospace;
-    font-size:.68rem;color:#777;margin-right:5px;
+.vid-card::before {
+  content:''; position:absolute; inset:0; border-radius:18px; padding:1px;
+  background: linear-gradient(135deg, var(--accent1), transparent 60%, var(--accent2));
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: destination-out; mask-composite: exclude; pointer-events:none;
 }
-.divider{border:none;border-top:1px solid #1a1a28;margin:1.2rem 0;}
-.info-box{
-    background:#0d1a0d;border:1px solid #1a3a1a;border-radius:10px;
-    padding:.75rem 1rem;font-family:'Space Mono',monospace;font-size:.73rem;color:#4ade80;margin:.7rem 0;
+.vid-thumb { width:100%; display:block; aspect-ratio:16/9; object-fit:cover; }
+.vid-body { padding:1.4rem 1.4rem 1rem; }
+.vid-title { font-family: var(--font-body); font-weight:700; font-size:1.05rem; color:#fff; margin:0 0 .7rem; line-height:1.35; }
+.meta-row { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:.5rem; }
+.meta-chip { background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.08); border-radius:8px; padding:3px 11px; font-family: var(--font-mono); font-size:.68rem; color: var(--muted); }
+.meta-chip span { color: var(--text); }
+.stat-bar { display:flex; gap:1px; margin:.3rem 0 1rem; }
+.stat-seg { height:3px; flex:1; border-radius:2px; background: var(--border); }
+.stat-seg.lit { background: linear-gradient(90deg, var(--accent1), var(--accent2)); }
+
+/* Section header */
+.section-hdr { font-family: var(--font-mono); font-size:.62rem; letter-spacing:4px; color: var(--accent2); text-transform:uppercase; margin:1.8rem 0 .6rem; }
+
+/* Alerts */
+.stAlert { border-radius:12px !important; font-family: var(--font-mono) !important; font-size:.78rem !important; }
+.stSpinner > div { border-top-color: var(--accent1) !important; }
+
+/* Success banner */
+.success-banner {
+  background:rgba(0,232,122,.07); border:1px solid rgba(0,232,122,.2); border-radius:12px;
+  padding:.9rem 1.2rem; font-family: var(--font-mono); font-size:.75rem; color: var(--success);
+  text-align:center; letter-spacing:1px; margin-bottom:.8rem; animation: fadeUp .4s ease both;
 }
-.warn-box{
-    background:#1a140d;border:1px solid #3a2a1a;border-radius:10px;
-    padding:.75rem 1rem;font-family:'Space Mono',monospace;font-size:.73rem;color:#fb923c;margin:.7rem 0;
-}
+
+/* How it works cards */
+.how-card { text-align:center; padding:1.2rem .5rem; }
+.how-icon { font-size:2rem; margin-bottom:.5rem; }
+.how-step { font-family: var(--font-mono); font-size:.62rem; letter-spacing:2px; margin-bottom:.4rem; }
+.how-title { font-family: var(--font-body); font-weight:600; font-size:.85rem; color:#d4d4e8; }
+.how-desc { font-family: var(--font-mono); font-size:.65rem; color: var(--muted); margin-top:.3rem; }
+
+/* Progress bar */
+.stProgress > div > div > div > div { background: linear-gradient(90deg, var(--accent1), var(--accent2)) !important; }
+
+/* Scrollbar */
+::-webkit-scrollbar { width:5px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius:3px; }
+
+/* Footer */
+.footer { text-align:center; padding:2.5rem 0 1.5rem; font-family: var(--font-mono); font-size:.6rem; color: var(--muted); letter-spacing:2px; opacity:.6; }
+.footer a { color: var(--accent1); text-decoration:none; }
 </style>
 """, unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# UI HELPERS
+# HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def is_valid_yt(url: str) -> bool:
+def is_valid_youtube_url(url: str) -> bool:
     return bool(re.match(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/.+", url.strip()))
 
-def fmt_dur(s) -> str:
-    if not s: return "—"
-    h, r = divmod(int(s), 3600); m, sec = divmod(r, 60)
-    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+def fmt_duration(secs):
+    if not secs: return "—"
+    h, r = divmod(int(secs), 3600)
+    m, s = divmod(r, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
-def fmt_views(n) -> str:
+def fmt_views(n):
     if not n: return "—"
-    return f"{n/1e6:.1f}M" if n>=1e6 else f"{n/1e3:.1f}K" if n>=1e3 else str(n)
+    if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
+    if n >= 1_000: return f"{n/1_000:.0f}K"
+    return str(n)
 
-def human_size(b) -> str:
-    if not b: return "?"
-    if b>=1_073_741_824: return f"{b/1_073_741_824:.1f} GB"
-    if b>=1_048_576:     return f"{b/1_048_576:.1f} MB"
-    return f"{b/1024:.0f} KB"
+@st.cache_data(show_spinner=False)
+def fetch_info(url: str):
+    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True}) as ydl:
+        return ydl.extract_info(url, download=False)
 
+FORMATS = {
+    "⚡  MP4 · 1080p HD":            ("bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080]", False),
+    "🎬  MP4 · 720p HD":             ("bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720]",  False),
+    "📺  MP4 · 480p":                ("bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480]",  False),
+    "📱  MP4 · 360p (mobile)":       ("bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360]",  False),
+    "🎵  MP3 · Audio only (192kbps)":("bestaudio[ext=m4a]/bestaudio/best", True),
+}
 
-@st.cache_data(show_spinner=False, ttl=240)
-def cached_info(url: str) -> dict:
-    return _extract(url)
-
-
-def build_ui_formats(info: dict) -> list:
-    raw, out, seen = info.get("formats", []), [], set()
-    # audio
-    af = [f for f in raw if f.get("vcodec")=="none" and f.get("acodec") not in (None,"none") and f.get("url")]
-    if af:
-        b = max(af, key=lambda f: f.get("abr") or f.get("tbr") or 0)
-        out.append({"label":f"🎵 Audio  ({b.get('abr','?')} kbps · {b.get('ext','m4a')})",
-                    "url":b["url"],"ext":b.get("ext","m4a"),
-                    "filesize":b.get("filesize") or b.get("filesize_approx"),
-                    "is_audio":True,"filename":f"{info.get('title','audio')}.{b.get('ext','m4a')}"})
-    # muxed
-    for f in sorted([f for f in raw if f.get("vcodec") not in (None,"none") and f.get("acodec") not in (None,"none") and f.get("url")],
-                    key=lambda f: f.get("height") or 0, reverse=True):
-        h = f.get("height") or 0
-        if h and h not in seen:
-            seen.add(h); ext = f.get("ext","mp4")
-            out.append({"label":f"🎬 {h}p {ext.upper()} — video+audio","url":f["url"],"ext":ext,
-                        "filesize":f.get("filesize") or f.get("filesize_approx"),
-                        "is_audio":False,"filename":f"{info.get('title','video')}_{h}p.{ext}"})
-    # video-only dash
-    for f in sorted([f for f in raw if f.get("vcodec") not in (None,"none") and f.get("acodec") in (None,"none") and f.get("url")],
-                    key=lambda f: f.get("height") or 0, reverse=True):
-        h = f.get("height") or 0
-        if h and h not in seen:
-            seen.add(h); ext = f.get("ext","mp4")
-            out.append({"label":f"🎬 {h}p {ext.upper()} — video only (no audio)","url":f["url"],"ext":ext,
-                        "filesize":f.get("filesize") or f.get("filesize_approx"),
-                        "is_audio":False,"filename":f"{info.get('title','video')}_{h}p_video.{ext}"})
-    if not out and info.get("url"):
-        out.append({"label":"🎬 Best available","url":info["url"],"ext":info.get("ext","mp4"),
-                    "filesize":None,"is_audio":False,"filename":f"{info.get('title','video')}.{info.get('ext','mp4')}"})
-    return out
+def download_video(url, fmt_str, is_audio):
+    with tempfile.TemporaryDirectory() as tmp:
+        pp = [{"key":"FFmpegExtractAudio","preferredcodec":"mp3","preferredquality":"192"}] if is_audio else []
+        opts = {
+            "format": fmt_str, "outtmpl": os.path.join(tmp, "%(title)s.%(ext)s"),
+            "quiet": True, "no_warnings": True, "postprocessors": pp,
+            "merge_output_format": None if is_audio else "mp4",
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+        files = list(Path(tmp).iterdir())
+        if not files: raise FileNotFoundError("No output file produced.")
+        f = files[0]
+        return f.read_bytes(), f.name
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# UI LAYOUT
+# HERO
 # ─────────────────────────────────────────────────────────────────────────────
+st.markdown("""
+<div class="hero-wrap">
+  <div class="hero-eyebrow">⚡ Free · Open Source · No Login Required</div>
+  <h1 class="hero-title">VAULTDL</h1>
+  <p class="hero-tagline">// YouTube video &amp; audio downloader — powered by yt-dlp //</p>
+  <div class="pill-row">
+    <span class="pill">MP4 1080p</span>
+    <span class="pill">MP4 720p</span>
+    <span class="pill">MP4 480p</span>
+    <span class="pill pink">MP3 Audio</span>
+    <span class="pill yellow">ffmpeg engine</span>
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
-st.markdown('<div class="hero-title">YT Downloader</div>', unsafe_allow_html=True)
-st.markdown(f'<div class="hero-sub">UI + REST API · port {_API_PORT} · No 403</div>', unsafe_allow_html=True)
+st.markdown('<hr class="neon-divider">', unsafe_allow_html=True)
 
-tab_dl, tab_api = st.tabs(["▶️  Downloader", "🔌  API Docs"])
+# ─────────────────────────────────────────────────────────────────────────────
+# URL INPUT + FETCH
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown('<div class="input-label">▸ Paste YouTube URL</div>', unsafe_allow_html=True)
+url = st.text_input("url", placeholder="https://youtube.com/watch?v=dQw4w9WgXcQ", label_visibility="collapsed")
 
+fetch_btn = st.button("⚡  FETCH VIDEO INFO")
 
-# ── TAB 1: DOWNLOADER ─────────────────────────────────────────────────────────
-with tab_dl:
-    url_in = st.text_input("url", placeholder="https://youtube.com/watch?v=...", label_visibility="collapsed")
-    c1, _ = st.columns([1, 2])
-    with c1:
-        go = st.button("🔍 Fetch Info")
+if fetch_btn:
+    if not url:
+        st.error("Paste a YouTube URL above first.")
+    elif not is_valid_youtube_url(url):
+        st.error("Invalid YouTube URL — must contain youtube.com or youtu.be")
+    else:
+        with st.spinner("Connecting to YouTube…"):
+            try:
+                st.session_state["info"] = fetch_info(url)
+                st.session_state["url"]  = url
+            except Exception as e:
+                st.error(f"Could not fetch video info: {e}")
 
-    if go:
-        u = (url_in or "").strip()
-        if not u:
-            st.error("Paste a YouTube URL above.")
-        elif not is_valid_yt(u):
-            st.error("Not a valid YouTube URL.")
-        else:
-            with st.spinner("Fetching…"):
-                try:
-                    info = cached_info(u)
-                    st.session_state.update({"info": info, "url": u, "fmts": build_ui_formats(info)})
-                except Exception as exc:
-                    st.error(f"Fetch failed: {exc}")
+# ─────────────────────────────────────────────────────────────────────────────
+# VIDEO CARD + DOWNLOAD
+# ─────────────────────────────────────────────────────────────────────────────
+if "info" in st.session_state:
+    info = st.session_state["info"]
+    url  = st.session_state["url"]
 
-    if st.session_state.get("info"):
-        info = st.session_state["info"]
-        fmts = st.session_state["fmts"]
+    st.markdown('<hr class="neon-divider">', unsafe_allow_html=True)
 
-        st.markdown('<hr class="divider">', unsafe_allow_html=True)
-        thumb = info.get("thumbnail")
-        if thumb:
-            st.image(thumb, width="stretch")
+    thumb    = info.get("thumbnail", "")
+    title    = info.get("title", "Unknown Title")
+    uploader = info.get("uploader", "—")
+    dur      = fmt_duration(info.get("duration"))
+    views    = fmt_views(info.get("view_count"))
+    likes    = fmt_views(info.get("like_count"))
+    ud       = info.get("upload_date", "")
+    if ud and len(ud) == 8:
+        ud = f"{ud[6:]}/{ud[4:6]}/{ud[:4]}"
 
-        st.markdown(f'<div class="vtitle">{info.get("title","Unknown")}</div>', unsafe_allow_html=True)
-        st.markdown(
-            f'<span class="badge">⏱ {fmt_dur(info.get("duration"))}</span>'
-            f'<span class="badge">👁 {fmt_views(info.get("view_count"))}</span>'
-            f'<span class="badge">📺 {info.get("uploader","—")}</span>',
-            unsafe_allow_html=True,
-        )
-        st.markdown('<hr class="divider">', unsafe_allow_html=True)
-        st.markdown(
-            '<div class="info-box">✅ Direct CDN link — your browser downloads straight from YouTube. Zero server bytes = zero 403.</div>',
-            unsafe_allow_html=True,
-        )
+    # sparkline segments
+    segs = 24
+    lit  = min(segs, max(2, int(info.get("duration", 60)) % segs + 4))
+    seg_html = "".join(f'<div class="stat-seg {"lit" if i<lit else ""}"></div>' for i in range(segs))
 
-        labels = [f["label"] for f in fmts]
-        idx    = st.selectbox("Format", range(len(labels)), format_func=lambda i: labels[i])
-        chosen = fmts[idx]
-        st.caption(f"~{human_size(chosen['filesize'])}")
+    st.markdown(f"""
+    <div class="vid-card">
+      {"<img class='vid-thumb' src='" + thumb + "' />" if thumb else ""}
+      <div class="vid-body">
+        <div class="vid-title">{title}</div>
+        <div class="meta-row">
+          <div class="meta-chip">⏱ <span>{dur}</span></div>
+          <div class="meta-chip">👁 <span>{views} views</span></div>
+          <div class="meta-chip">👍 <span>{likes}</span></div>
+          <div class="meta-chip">📺 <span>{uploader}</span></div>
+          {"<div class='meta-chip'>📅 <span>" + ud + "</span></div>" if ud else ""}
+        </div>
+        <div class="stat-bar">{seg_html}</div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
 
-        safe_name = re.sub(r'[^\w\s\-.]', '', chosen["filename"])[:100]
-        st.markdown(
-            f'<a class="dl-btn" href="{chosen["url"]}" download="{safe_name}" target="_blank">'
-            f'⬇️&nbsp; Download &nbsp;{safe_name[:50]}{"…" if len(safe_name)>50 else ""}</a>',
-            unsafe_allow_html=True,
-        )
-        with st.expander("📋 Copy direct URL (IDM / aria2 / VLC)"):
-            st.code(chosen["url"], language=None)
+    # Format picker
+    st.markdown('<div class="section-hdr">▸ Select Format &amp; Quality</div>', unsafe_allow_html=True)
+    chosen = st.selectbox("FORMAT", list(FORMATS.keys()), index=0, label_visibility="collapsed")
+    fmt_str, is_audio = FORMATS[chosen]
 
-        st.markdown(
-            '<div class="warn-box">⚠️ CDN URLs expire in ~6 hours. Download immediately. Click Fetch again if link stops working.</div>',
-            unsafe_allow_html=True,
-        )
+    st.markdown("<br>", unsafe_allow_html=True)
 
+    if st.button("⬇  DOWNLOAD NOW"):
+        prog = st.progress(0, text="Initialising…")
+        try:
+            prog.progress(10, text="Resolving stream…")
+            prog.progress(35, text="Downloading…")
+            file_bytes, filename = download_video(url, fmt_str, is_audio)
+            prog.progress(85, text="Merging & encoding…")
+            prog.progress(100, text="✅ Complete!")
+            mime = "audio/mpeg" if is_audio else "video/mp4"
+            safe = re.sub(r'[^\w\-_. ]', '_', filename)[:80]
+            st.markdown('<div class="success-banner">✅ &nbsp; FILE READY — Click the button below to save</div>', unsafe_allow_html=True)
+            st.download_button(f"💾  SAVE FILE  ·  {safe}", data=file_bytes, file_name=safe, mime=mime)
+        except Exception as e:
+            prog.empty()
+            st.error(f"Download failed: {e}")
+            st.info("Tip: Some videos are age-gated or geo-blocked. Try another format or video.")
 
-# ── TAB 2: API DOCS ──────────────────────────────────────────────────────────
-with tab_api:
-    st.markdown(f"### 🔌 REST API — port `{_API_PORT}`")
-    st.markdown(
-        f"**Swagger UI** → `http://localhost:{_API_PORT}/docs`  \n"
-        f"**ReDoc**      → `http://localhost:{_API_PORT}/redoc`"
-    )
-    st.markdown('<hr class="divider">', unsafe_allow_html=True)
+# ─────────────────────────────────────────────────────────────────────────────
+# HOW IT WORKS
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown('<hr class="neon-divider">', unsafe_allow_html=True)
+c1, c2, c3 = st.columns(3)
+for col, icon, step_color, step, title, desc in [
+    (c1, "📋", "var(--accent1)", "STEP 01", "Paste URL",     "Any youtube.com or youtu.be link"),
+    (c2, "🎛",  "var(--accent2)", "STEP 02", "Pick Quality",  "1080p · 720p · 480p · MP3"),
+    (c3, "💾",  "var(--accent3)", "STEP 03", "Download File", "No watermark · No account"),
+]:
+    with col:
+        st.markdown(f"""
+        <div class="how-card">
+          <div class="how-icon">{icon}</div>
+          <div class="how-step" style="color:{step_color};">{step}</div>
+          <div class="how-title">{title}</div>
+          <div class="how-desc">{desc}</div>
+        </div>""", unsafe_allow_html=True)
 
-    ENDPOINTS = [
-        {
-            "path": "/health",
-            "desc": "Health check.",
-            "example": f"curl http://localhost:{_API_PORT}/health",
-            "response": '{"status":"ok","service":"YT Downloader API","version":"2.1.0"}',
-        },
-        {
-            "path": f"/api/info?url={{youtube_url}}",
-            "desc": "Full metadata + all formats with direct CDN URLs.",
-            "example": f'curl "http://localhost:{_API_PORT}/api/info?url=https://youtu.be/dQw4w9WgXcQ"',
-            "response": '{"id":"dQw4w9WgXcQ","title":"...","duration":212,"formats":[{"format_id":"22","kind":"muxed","ext":"mp4","height":720,"url":"https://..."},...]}',
-        },
-        {
-            "path": "/api/formats?url={youtube_url}",
-            "desc": "Format list only — lighter than /api/info.",
-            "example": f'curl "http://localhost:{_API_PORT}/api/formats?url=https://youtu.be/dQw4w9WgXcQ"',
-            "response": '{"id":"...","title":"...","formats":[...]}',
-        },
-        {
-            "path": "/api/stream?url={youtube_url}&format_id={id}",
-            "desc": "Single direct CDN URL for one format. Omit format_id for best available.",
-            "example": f'curl "http://localhost:{_API_PORT}/api/stream?url=https://youtu.be/dQw4w9WgXcQ&format_id=22"',
-            "response": '{"title":"...","format_id":"22","ext":"mp4","height":720,"stream_url":"https://...","expires_in":"~6 hours"}',
-        },
-        {
-            "path": "/api/search?q={query}&max_results=5",
-            "desc": "Search YouTube. Returns title, url, thumbnail, duration, views.",
-            "example": f'curl "http://localhost:{_API_PORT}/api/search?q=lofi+hip+hop&max_results=3"',
-            "response": '{"query":"lofi hip hop","results":[{"id":"...","title":"...","url":"...","thumbnail":"...","duration":3600}]}',
-        },
-    ]
-
-    for ep in ENDPOINTS:
-        st.markdown(
-            f'<div class="api-card">'
-            f'<span class="api-method get">GET</span>'
-            f'<span class="api-path">{ep["path"]}</span>'
-            f'<div class="api-desc">{ep["desc"]}</div>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
-        with st.expander(f"Example — {ep['path'].split('?')[0]}"):
-            st.markdown("**Request:**")
-            st.code(ep["example"], language="bash")
-            st.markdown("**Response:**")
-            st.code(ep["response"], language="json")
-
-    st.markdown('<hr class="divider">', unsafe_allow_html=True)
-    st.markdown("### 🐍 Python")
-    st.code(f"""import requests
-
-BASE = "http://localhost:{_API_PORT}"
-
-# Get all formats
-info = requests.get(f"{{BASE}}/api/info", params={{"url": "https://youtu.be/dQw4w9WgXcQ"}}).json()
-print(info["title"])
-
-# Best muxed (video+audio) stream URL
-muxed = [f for f in info["formats"] if f["kind"] == "muxed"]
-stream_url = muxed[0]["url"]   # open this in your browser or IDM — never 403
-
-# Search
-res = requests.get(f"{{BASE}}/api/search", params={{"q": "lofi", "max_results": 3}}).json()
-for r in res["results"]:
-    print(r["title"], r["url"])
-""", language="python")
-
-    st.markdown("### 🌐 JavaScript")
-    st.code(f"""const BASE = "http://localhost:{_API_PORT}";
-
-const info = await fetch(`${{BASE}}/api/info?url=https://youtu.be/dQw4w9WgXcQ`).then(r=>r.json());
-const best = info.formats.find(f => f.kind === "muxed");
-
-// Trigger browser download
-const a = document.createElement("a");
-a.href = best.url;
-a.download = `${{info.title}}.${{best.ext}}`;
-a.click();
-""", language="javascript")
-
-
-# ── Footer ─────────────────────────────────────────────────────────────────────
-st.markdown('<hr class="divider">', unsafe_allow_html=True)
-st.markdown(
-    '<p style="font-family:\'Space Mono\',monospace;font-size:.62rem;color:#2a2a2a;text-align:center;">'
-    'Powered by yt-dlp + FastAPI + Streamlit · Personal/educational use only'
-    '</p>',
-    unsafe_allow_html=True,
-)
+# ─────────────────────────────────────────────────────────────────────────────
+# FOOTER
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("""
+<div class="footer">
+  VAULTDL &nbsp;·&nbsp; powered by <a href="https://github.com/yt-dlp/yt-dlp" target="_blank">yt-dlp</a> &amp; ffmpeg
+  &nbsp;·&nbsp; personal / educational use only &nbsp;·&nbsp; respect creators &amp; YouTube ToS
+</div>
+""", unsafe_allow_html=True)
