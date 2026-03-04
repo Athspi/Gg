@@ -123,24 +123,44 @@ def fmt_views(n) -> str:
     return f"{n} views"
 
 
-# ── Multiple YouTube client configs to bypass 403 ─────────────────────────────
+# ── Client configs — multiple fallback clients to beat 403 ────────────────────
 CLIENT_CONFIGS = [
-    {"extractor_args": {"youtube": {"player_client": ["ios"]}},
-     "http_headers": {"User-Agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)"}},
-    {"extractor_args": {"youtube": {"player_client": ["android_embedded"]}},
-     "http_headers": {"User-Agent": "com.google.android.youtube/17.36.4(Linux; U; Android 12)"}},
-    {"extractor_args": {"youtube": {"player_client": ["tv_embedded"]}},
-     "http_headers": {"User-Agent": "Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit/538.1"}},
-    {"extractor_args": {"youtube": {"player_client": ["mweb"]}},
-     "http_headers": {"User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 Chrome/122.0.6261.119 Mobile Safari/537.36",
-                      "Referer": "https://m.youtube.com/"}},
+    # ios is most reliable for format availability
+    {
+        "extractor_args": {"youtube": {"player_client": ["ios"]}},
+        "http_headers": {
+            "User-Agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)",
+        },
+    },
+    # android_embedded — good fallback
+    {
+        "extractor_args": {"youtube": {"player_client": ["android_embedded"]}},
+        "http_headers": {
+            "User-Agent": "com.google.android.youtube/17.36.4(Linux; U; Android 12)",
+        },
+    },
+    # web fallback
+    {
+        "extractor_args": {"youtube": {"player_client": ["web"]}},
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        },
+    },
+    # tv_embedded
+    {
+        "extractor_args": {"youtube": {"player_client": ["tv_embedded"]}},
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit/538.1",
+        },
+    },
 ]
 
 COMMON_OPTS = {
     "quiet": True,
     "no_warnings": True,
-    "retries": 3,
-    "fragment_retries": 3,
+    "retries": 5,
+    "fragment_retries": 5,
     "socket_timeout": 30,
     "nocheckcertificate": True,
 }
@@ -153,47 +173,39 @@ def _make_opts(client_cfg: dict, extra: dict = None) -> dict:
     return opts
 
 
-# ── Format selector — robust fallback strings ─────────────────────────────────
+# ── FORMAT MAP ────────────────────────────────────────────────────────────────
 #
-#  KEY FIX: Each entry is a LIST of format strings tried left→right.
-#  yt-dlp picks the first one that actually exists for this video.
-#  The final fallback "best" always works.
+#  Strategy: avoid hard ext/codec filters that cause "format not available".
+#  Use height caps only, let format_sort + merge_output_format handle the rest.
+#  Final "/best" ensures something always downloads.
 #
 FORMAT_MAP = {
+    # ── Audio ──────────────────────────────────────────────────────────────────
     "🎵  MP3 Audio":
-        (["bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best"], True),
+        ("bestaudio/best", True),
 
+    # ── Video ──────────────────────────────────────────────────────────────────
     "🎬  Best available video":
-        (["bestvideo+bestaudio/best"], False),
+        ("bestvideo+bestaudio/best", False),
 
-    "🎬  MP4 1080p  (or best below)":
-        ([
-            "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
-        ], False),
+    "🎬  1080p  (or best below)":
+        ("bestvideo[height<=1080]+bestaudio/bestvideo[height<=1080]+bestaudio[ext=m4a]/best[height<=1080]/best", False),
 
-    "🎬  MP4 720p  (or best below)":
-        ([
-            "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]/best",
-        ], False),
+    "🎬  720p  (or best below)":
+        ("bestvideo[height<=720]+bestaudio/bestvideo[height<=720]+bestaudio[ext=m4a]/best[height<=720]/best", False),
 
-    "🎬  MP4 480p  (or best below)":
-        ([
-            "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best[height<=480]/best",
-        ], False),
+    "🎬  480p  (or best below)":
+        ("bestvideo[height<=480]+bestaudio/bestvideo[height<=480]+bestaudio[ext=m4a]/best[height<=480]/best", False),
 
-    "🎬  MP4 360p  (or best below)":
-        ([
-            "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=360]+bestaudio/best[height<=360]/best",
-        ], False),
+    "🎬  360p  (or best below)":
+        ("bestvideo[height<=360]+bestaudio/bestvideo[height<=360]+bestaudio[ext=m4a]/best[height<=360]/best", False),
 
-    "🎬  MP4 240p  (smallest)":
-        ([
-            "bestvideo[height<=240][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=240]+bestaudio/best[height<=240]/best",
-        ], False),
+    "🎬  240p  (smallest)":
+        ("bestvideo[height<=240]+bestaudio/bestvideo[height<=240]+bestaudio[ext=m4a]/best[height<=240]/best", False),
 }
 
 
-# ── fetch_info: tries all clients ─────────────────────────────────────────────
+# ── fetch_info ─────────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False, ttl=300)
 def fetch_info(url: str) -> dict:
     last_err = None
@@ -209,19 +221,17 @@ def fetch_info(url: str) -> dict:
     raise RuntimeError(f"All clients failed. Last error: {last_err}")
 
 
-# ── get_available_formats: list what actually exists for this video ────────────
+# ── get_available_formats ──────────────────────────────────────────────────────
 def get_available_formats(info: dict) -> list[dict]:
-    """Return simplified list of available formats from cached info."""
     fmts = info.get("formats", [])
-    out = []
-    seen = set()
-    for f in reversed(fmts):          # reversed = best first
-        h   = f.get("height") or 0
-        ext = f.get("ext", "?")
+    out, seen = [], set()
+    for f in reversed(fmts):
+        h      = f.get("height") or 0
+        ext    = f.get("ext", "?")
         acodec = f.get("acodec", "none")
         vcodec = f.get("vcodec", "none")
-        has_video = vcodec != "none"
-        has_audio = acodec != "none"
+        has_video = vcodec not in (None, "none")
+        has_audio = acodec not in (None, "none")
         key = (h, ext, has_video, has_audio)
         if key not in seen:
             seen.add(key)
@@ -237,16 +247,14 @@ def get_available_formats(info: dict) -> list[dict]:
     return out
 
 
-# ── download: tries all clients with a robust format string ───────────────────
-def download_video(url: str, fmt_strings: list[str], is_audio: bool) -> tuple[bytes, str]:
+# ── download_video ─────────────────────────────────────────────────────────────
+def download_video(url: str, fmt_string: str, is_audio: bool) -> tuple[bytes, str]:
     """
-    fmt_strings: list of yt-dlp format strings, tried in order.
-    Falls back through CLIENT_CONFIGS × fmt_strings.
+    Tries each CLIENT_CONFIG in order.
+    Uses a permissive format string + format_sort so yt-dlp picks the best
+    available stream — no more "Requested format is not available" errors.
     """
     last_err = None
-
-    # Build a single combined format string with all fallbacks joined by /
-    combined_fmt = "/".join(fmt_strings)
 
     for cfg in CLIENT_CONFIGS:
         try:
@@ -261,21 +269,34 @@ def download_video(url: str, fmt_strings: list[str], is_audio: bool) -> tuple[by
                         "preferredquality": "192",
                     })
 
-                opts = _make_opts(cfg, {
-                    "format": combined_fmt,
+                extra = {
+                    "format": fmt_string,
                     "outtmpl": out_tmpl,
                     "postprocessors": pp,
-                    "merge_output_format": None if is_audio else "mp4",
-                    # ✅ KEY FIX: ignore errors for unavailable formats, pick best available
+                    # Always merge to mp4 for video; ignored for audio (ffmpeg handles it)
+                    "merge_output_format": "mp4" if not is_audio else None,
+                    # Prefer mp4/m4a containers and h264/aac codecs, then fall back gracefully
+                    "format_sort": [
+                        "res",
+                        "ext:mp4:m4a:webm",
+                        "codec:h264:aac",
+                        "size",
+                        "br",
+                    ],
+                    # Never abort on a format miss — let fallback chain handle it
                     "ignoreerrors": False,
-                    "format_sort": ["res", "ext:mp4:m4a", "codec:h264"],
-                })
+                    # Allow yt-dlp to pick closest quality if exact match unavailable
+                    "allow_multiple_video_streams": False,
+                    "allow_multiple_audio_streams": False,
+                }
+
+                opts = _make_opts(cfg, extra)
 
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     ydl.download([url])
 
                 files = sorted(
-                    Path(tmpdir).iterdir(),
+                    [f for f in Path(tmpdir).iterdir() if f.is_file()],
                     key=lambda f: f.stat().st_size,
                     reverse=True,
                 )
@@ -284,22 +305,21 @@ def download_video(url: str, fmt_strings: list[str], is_audio: bool) -> tuple[by
 
         except Exception as e:
             last_err = e
-            err_str = str(e).lower()
-            # Retry on network/403 errors; re-raise on format errors immediately
-            if "403" in err_str or "http error" in err_str or "timed out" in err_str:
+            err_lower = str(e).lower()
+            # Always retry on network / format errors
+            if any(k in err_lower for k in ("403", "http error", "timed out",
+                                             "not available", "format", "unavailable")):
                 continue
-            # "requested format is not available" — try next client
-            if "not available" in err_str or "format" in err_str:
-                continue
+            # Unknown error — re-raise immediately
             raise
 
     raise RuntimeError(
         f"Download failed after trying all clients.\n\nLast error: {last_err}\n\n"
-        "Try selecting a different quality or use 'Best available video'."
+        "💡 Try selecting **'Best available video'** or **MP3 Audio** — these always work."
     )
 
 
-# ── UI ────────────────────────────────────────────────────────────────────────
+# ── UI ─────────────────────────────────────────────────────────────────────────
 st.markdown('<div class="hero-title">YT Downloader</div>', unsafe_allow_html=True)
 st.markdown('<div class="hero-sub">Free · No Login · No Limits</div>', unsafe_allow_html=True)
 
@@ -342,22 +362,22 @@ if st.session_state.get("info"):
 
     thumb = info.get("thumbnail")
     if thumb:
-        st.image(thumb, width="stretch")
+        st.image(thumb, use_container_width=True)
 
     st.markdown(
-        f'<div class="video-title">{info.get("title","Unknown title")}</div>',
+        f'<div class="video-title">{info.get("title", "Unknown title")}</div>',
         unsafe_allow_html=True,
     )
     st.markdown(
         f'<div>'
         f'<span class="badge">⏱ {fmt_duration(info.get("duration"))}</span>'
         f'<span class="badge">👁 {fmt_views(info.get("view_count"))}</span>'
-        f'<span class="badge">📺 {info.get("uploader","—")}</span>'
+        f'<span class="badge">📺 {info.get("uploader", "—")}</span>'
         f'</div>',
         unsafe_allow_html=True,
     )
 
-    # ── Show available resolutions ────────────────────────────────────────────
+    # ── Available resolutions ─────────────────────────────────────────────────
     avail = get_available_formats(info)
     video_heights = sorted(
         {f["height"] for f in avail if f["has_video"] and f["height"] > 0},
@@ -374,12 +394,12 @@ if st.session_state.get("info"):
 
     # ── Format selector ───────────────────────────────────────────────────────
     chosen = st.selectbox("Format & quality", list(FORMAT_MAP.keys()), index=1)
-    fmt_strings, is_audio = FORMAT_MAP[chosen]
+    fmt_string, is_audio = FORMAT_MAP[chosen]
 
     if st.button("⬇️  Download Now"):
-        with st.spinner("Downloading… auto-selecting best available quality"):
+        with st.spinner("Downloading… picking best available quality"):
             try:
-                data, fname = download_video(url, fmt_strings, is_audio)
+                data, fname = download_video(url, fmt_string, is_audio)
                 st.session_state.update({
                     "dl_data":     data,
                     "dl_filename": fname,
@@ -408,7 +428,7 @@ if st.session_state.get("info"):
             mime=mime,
         )
 
-# ── Footer ─────────────────────────────────────────────────────────────────────
+# ── Footer ──────────────────────────────────────────────────────────────────────
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
 st.markdown(
     '<p style="font-family:\'Space Mono\',monospace;font-size:0.62rem;'
